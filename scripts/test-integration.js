@@ -3541,6 +3541,153 @@ async function runFlow() {
     rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [exU] }, 'c');
     assert(rr.status === 200 && rr.body.exhibitCount === 1, '按展品重建');
   }
+
+  // =======================================================================
+  // 局部重算：首尾相接、照度不同的两条已确认实测必须逐条计量，
+  // 不得合并成一段并沿用前条照度（年度占用表与展品详情/分级预警一致）
+  // =======================================================================
+  {
+    const q = async (text, params = []) => (await dbModule.pool.query(text, params)).rows;
+    const usageRow = async (exId, year) =>
+      (await q('SELECT * FROM annual_usage WHERE exhibit_id = $1 AND year = $2', [exId, year]))[0] || null;
+    const createMeas = async (planId, body) => {
+      const cr = await call('POST', '/api/measurements', { planId, ...body }, 'c');
+      assert(cr.status === 201, `录入实测：${cr.status} ${cr.body && cr.body.error}`);
+      return cr.body.measurement.id;
+    };
+    const confirmMeas = async (id) => {
+      const cr = await call('POST', `/api/measurements/${id}/confirm`, {}, 'c');
+      assert(cr.status === 200, `确认实测 #${id}：${cr.status} ${cr.body && cr.body.error}`);
+      return cr;
+    };
+
+    // ---- A. 同年相接异照度：09-13 @100=400，13-17 @200=800；残余按实测时间覆盖扣到 0 ----
+    const exA = await createExhibit('相接实测同年局部重算');
+    await call('POST', `/api/exhibits/${exA}/limits`, { year: 2026, limitLxh: 2000 }, 'c');
+    // 阈值：40%（800 跨 low）/ 55%（1200=60% 跨 high）——预警必须依据修复后的真实占用
+    await call('POST', `/api/exhibits/${exA}/quota-thresholds`,
+      { year: 2026, lowPct: 40, highPct: 55 }, 'c');
+    const pTouch = await submitPlan(exA, '相接实测计划', '2026-05-02', '2026-05-02',
+      ['09:00-17:00'], 100);
+    await approvePlan(pTouch);
+    const a1 = await createMeas(pTouch, {
+      startDate: '2026-05-02', startTime: '09:00', endDate: '2026-05-02', endTime: '13:00', actualLux: 100,
+    });
+    await confirmMeas(a1); // 实测 400 + 残余 400 = 800（80%，跨 low 不跨 high）
+    const a2 = await createMeas(pTouch, {
+      startDate: '2026-05-02', startTime: '13:00', endDate: '2026-05-02', endTime: '17:00', actualLux: 200,
+    });
+    await confirmMeas(a2); // 与 a1 首尾相接、照度不同：实测 +800、残余再扣 400 → 合计 1200
+    let row = await usageRow(exA, 2026);
+    assert(Number(row.confirmed_lxh) === 1200 && Number(row.residue_lxh) === 0
+      && Number(row.used_lxh) === 1200,
+      `同年相接异照度实测逐条计量 1200、残余按时间覆盖扣减为 0（旧口径误算 800/400）：${JSON.stringify(row)}`);
+    let det = await call('GET', `/api/exhibits/${exA}`, null, 'i');
+    assert(det.body.years['2026'].used === 1200, '展品详情与年度占用一致（1200）');
+    // 分级预警必须依据正确占用：800(low) → 1200(120%) 向上跨高档留一条 high 事件
+    let alerts = await call('GET', `/api/quota-alerts?exhibitId=${exA}`, null, 'i');
+    const highEvt = alerts.body.events.find((e) => e.level === 'high');
+    assert(highEvt && highEvt.used === 1200 && highEvt.previousLevel === 'low',
+      `相接异照度实测确认后按正确占用 1200 跨高档：${JSON.stringify(alerts.body.events.map((e) => [e.level, e.used]))}`);
+    assert(det.body.quotaThresholds[0].level === 'high', '阈值当前级别与详情占用一致 high');
+
+    // ---- B. 跨年相接：跨年实测 A（23:00~次日01:00 @100）与次年实测 B（01:00~02:00 @300）年界相接 ----
+    const exX = await createExhibit('相接实测跨年局部重算');
+    await call('POST', `/api/exhibits/${exX}/limits`, { year: 2025, limitLxh: 10000 }, 'c');
+    await call('POST', `/api/exhibits/${exX}/limits`, { year: 2026, limitLxh: 10000 }, 'c');
+    const pCross = await submitPlan(exX, '跨年相接计划', '2025-12-31', '2026-01-01',
+      ['22:00-02:00'], 100);
+    await approvePlan(pCross);
+    // 计划窗按日展开：2025-12-31 的窗 22:00~次日 02:00（2025 占 22-24 共 2h、2026 占 00-02 共 2h），
+    // 2026-01-01 的窗 22:00~次日 02:00（2026 占 22-24 共 2h）。
+    // 即 2025 窗内毛估 2h=200，2026 窗内毛估 6h=600（次日 00-02 与当日 22-24）。
+    const xA = await createMeas(pCross, {
+      startDate: '2025-12-31', startTime: '23:00', endDate: '2026-01-01', endTime: '01:00', actualLux: 100,
+    }); // 2025: 1h=100；2026: 1h=100
+    await confirmMeas(xA);
+    row = await usageRow(exX, 2025);
+    let row26 = await usageRow(exX, 2026);
+    // 2025：实测 100 + 残余(22-23 一小时)100 = 200；2026：实测 100 + 残余 600-100=500 = 600
+    assert(Number(row.used_lxh) === 200 && Number(row.confirmed_lxh) === 100
+      && Number(row.residue_lxh) === 100,
+      `跨年实测确认后 2025 年裁剪计量：${JSON.stringify(row)}`);
+    assert(Number(row26.used_lxh) === 600 && Number(row26.confirmed_lxh) === 100
+      && Number(row26.residue_lxh) === 500,
+      `跨年实测确认后 2026 年裁剪计量：${JSON.stringify(row26)}`);
+
+    const xB = await createMeas(pCross, {
+      startDate: '2026-01-01', startTime: '01:00', endDate: '2026-01-01', endTime: '02:00', actualLux: 300,
+    }); // 2026: 1h=300，与 A 落在 2026 的片段在 01:00 首尾相接
+    await confirmMeas(xB); // 只影响 2026
+    row = await usageRow(exX, 2025);
+    row26 = await usageRow(exX, 2026);
+    assert(Number(row.used_lxh) === 200, '未受影响年份 2025 占用不变（200）');
+    // 2026：A 段 100(00-01) + B 300(01-02) = 400，window1 窗内 00-02 两小时被实测全覆盖；
+    // 残余 = 毛估 600 − window1 覆盖 200 = 400（相接两段分别按各自照度计量，不吞并）→ 合计 800
+    assert(Number(row26.confirmed_lxh) === 400 && Number(row26.residue_lxh) === 400
+      && Number(row26.used_lxh) === 800,
+      `年界相接异照度实测：2026 逐条计量 400（旧口径误把跨年来的 A 段并入 B 照度）：${JSON.stringify(row26)}`);
+    det = await call('GET', `/api/exhibits/${exX}`, null, 'i');
+    assert(det.body.years['2025'].used === 200 && det.body.years['2026'].used === 800,
+      '跨年展品详情两年占用均与派生表一致');
+
+    // ---- C. 实测纠错：原记录跨年（影响年份并集 2025+2026），旧/新贡献按各自照度撤计 ----
+    let cr = await call('POST', `/api/measurements/${xA}/correct`, {
+      startDate: '2025-12-31', startTime: '22:00',
+      endDate: '2026-01-01', endTime: '01:00', actualLux: 200,
+      reason: '跨年纠错重算测试',
+    }, 'c'); // 新段 22:00~01:00 @200：2025 2h=400；2026 1h=200；与 B(01-02) 相接不重叠
+    assert(cr.status === 200, `跨年纠错生效：${cr.status} ${JSON.stringify(cr.body && cr.body.error)}`);
+    row = await usageRow(exX, 2025);
+    row26 = await usageRow(exX, 2026);
+    // 2025：新实测 400（22-24 全覆盖，残余 0）；
+    // 2026：新 A' 200(00-01 @200lx) + B 300(01-02 @300lx) = 500；计划估算残余仍按“实测时间覆盖”
+    // 扣减（与实测照度无关）：window1 的 00-02 两小时仍被全覆盖 → 600-200=400，合计 900。
+    assert(Number(row.confirmed_lxh) === 400 && Number(row.residue_lxh) === 0
+      && Number(row.used_lxh) === 400,
+      `纠错后 2025 撤旧 100 计新 400：${JSON.stringify(row)}`);
+    assert(Number(row26.confirmed_lxh) === 500 && Number(row26.residue_lxh) === 400
+      && Number(row26.used_lxh) === 900,
+      `纠错后 2026 新 A' 200 与 B 300 相接但分别计量、残余按时间覆盖扣减：${JSON.stringify(row26)}`);
+
+    // ---- C2. 纠错失败：原记录已在上一步作废，再次纠错返回 400，整笔回滚，占用不变 ----
+    const before25 = await usageRow(exX, 2025);
+    const before26 = await usageRow(exX, 2026);
+    cr = await call('POST', `/api/measurements/${xA}/correct`, {
+      startDate: '2025-12-31', startTime: '23:30',
+      endDate: '2026-01-01', endTime: '00:30', actualLux: 50,
+      reason: '对已作废记录再次纠错，应失败',
+    }, 'c');
+    assert(cr.status === 400, '对已作废实测再次纠错 400（任何失败都不得改动占用）');
+    row = await usageRow(exX, 2025);
+    row26 = await usageRow(exX, 2026);
+    assert(Number(row.used_lxh) === Number(before25.used_lxh)
+      && Number(row26.used_lxh) === Number(before26.used_lxh),
+      '纠错失败整笔回滚：两年派生占用不变');
+
+    // ---- D. 批次确认：同批两条首尾相接、照度不同的行逐条计量 ----
+    const exBatch = await createExhibit('相接实测批次局部重算');
+    await call('POST', `/api/exhibits/${exBatch}/limits`, { year: 2026, limitLxh: 10000 }, 'c');
+    const pBatch = await submitPlan(exBatch, '相接批次计划', '2026-06-01', '2026-06-01',
+      ['09:00-17:00'], 100);
+    await approvePlan(pBatch);
+    const csvTouch =
+      '开始时间,结束时间,实际照度,备注\n' +
+      '2026-06-01 09:00,2026-06-01 12:00,100,前段\n' +
+      '2026-06-01 12:00,2026-06-01 17:00,200,后段\n';
+    cr = await call('POST', '/api/measurement-batches', { planId: pBatch, csv: csvTouch }, 'c');
+    assert(cr.status === 201, '导入相接异照度批次');
+    const batchId = cr.body.batch.id;
+    cr = await call('POST', `/api/measurement-batches/${batchId}/confirm`, {}, 'c');
+    assert(cr.status === 200, `批次确认成功：${cr.status} ${cr.body && cr.body.error}`);
+    row = await usageRow(exBatch, 2026);
+    // 3h×100=300 + 5h×200=1000 = 1300；整窗被覆盖，残余 0
+    assert(Number(row.confirmed_lxh) === 1300 && Number(row.residue_lxh) === 0
+      && Number(row.used_lxh) === 1300,
+      `批次相接异照度行逐条计量 1300、残余 0（旧口径误合并为 800/400）：${JSON.stringify(row)}`);
+    det = await call('GET', `/api/exhibits/${exBatch}`, null, 'i');
+    assert(det.body.years['2026'].used === 1300, '批次确认后展品详情与年度占用一致（1300）');
+  }
 }
 
 main().catch((err) => {

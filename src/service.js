@@ -956,6 +956,9 @@ function clipIntervalToWindowsForPlan(planWinList, incidentWindows) {
  * options.years 非空时为“按受影响自然年局部重算”：只读取与这些年份相交的历史记录与计划，
  * 返回的 used/sources/years 也只含这些年份（各来源剂量先按自然年拆分再裁剪到目标年份，
  * 跨年记录的各年互不干扰）；展品详情等读取场景不传 years，行为与历史完全一致。
+ * 实测部分的裁剪严格“逐条来源独立”：首尾相接（含相接点恰为年界）但照度不同的两条实测
+ * 各自按自身时段与照度裁剪、拆分，绝不合并成一段而吞并另一条来源；计划估算残余仍只按
+ * 实测时间覆盖扣减，相接两条的覆盖不重不漏。
  */
 async function computeOccupancy(client, exhibitId, {
   excludePlanId = null,
@@ -1015,6 +1018,8 @@ async function computeOccupancy(client, exhibitId, {
 
   // 局部重算时把各类时间窗先裁剪到受影响年份的年界区间，再做相减/相交，
   // 保证窗外年份的剂量不会经事故替代估算等途径渗入目标年份。
+  // 注意：事故/共享照明/停灯窗只作为“覆盖/相交窗”使用（窗上不带各自照度参与计量，
+  // 剂量在各自来源循环里逐条计算），合并相接段不影响结果。
   const clipToBounds = (windows) => {
     if (!bounds) return windows;
     const parts = [];
@@ -1027,7 +1032,28 @@ async function computeOccupancy(client, exhibitId, {
     }
     return subtractIntervals(parts, []);
   };
-  const scopedMeasWindows = clipToBounds(measWindows);
+  // 实测窗裁剪必须“逐条来源独立”：每条实测带自己的照度（mw.lux）与来源身份（mw.id），
+  // 两条首尾相接但照度不同的实测若被合并成一段，合并段会沿用首条照度而吞并另一条来源，
+  // 导致按年局部重算的年度占用与展品详情（全量口径逐条计量）不一致。
+  // 因此这里只按 bounds 切出各条实测落在受影响年份内的片段，绝不跨实测合并
+  // （同一条实测在 bounds 不连续时可能产出多段，各段仍带同一来源，剂量等价于整段拆分；
+  // 用 measWindows 的数组下标 key 而非 id 聚合——预演的多条草稿实测 id 均为 -1）。
+  const scopedMeasWindows = [];
+  const measFragmentsByKey = new Map();
+  measWindows.forEach((mw, idx) => {
+    const key = `m${idx}`;
+    const frags = bounds ? [] : [{ ...mw }];
+    if (bounds) {
+      for (const r of bounds) {
+        const s = Math.max(mw.start, r.startMs);
+        const e = Math.min(mw.end, r.endMs);
+        if (e > s) frags.push({ ...mw, start: s, end: e });
+      }
+      frags.sort((a, b) => a.start - b.start || a.end - b.end);
+    }
+    measFragmentsByKey.set(key, frags);
+    scopedMeasWindows.push(...frags);
+  });
   const scopedIncidentWindows = clipToBounds(incidentView.windows);
   const scopedSharedWindows = clipToBounds(sharedView.windows);
   // 停灯有效扣减窗按计划裁剪
@@ -1050,8 +1076,16 @@ async function computeOccupancy(client, exhibitId, {
   const sources = [];
 
   // 1) 实测部分（停灯不减实测）
-  for (const mw of scopedMeasWindows) {
-    const yearly = keepYears(yearMapToObject(doseByYear([{ start: mw.start, end: mw.end }], mw.lux)));
+  //    局部重算下同一条实测可能被裁成多段（受影响年份不连续），按来源聚合回一条，
+  //    逐段按各自照度计量后合并按年剂量；不同实测即使首尾相接也各自独立，绝不吞并。
+  measWindows.forEach((mw, idx) => {
+    const segs = bounds ? (measFragmentsByKey.get(`m${idx}`) || []) : [mw];
+    if (bounds && segs.length === 0) return;
+    const yearly = keepYears(
+      yearMapToObject(
+        doseByYear(segs.map((s) => ({ start: s.start, end: s.end })), mw.lux)
+      )
+    );
     addYearDose(used, yearly);
     sources.push({
       kind: 'measurement',
@@ -1062,7 +1096,7 @@ async function computeOccupancy(client, exhibitId, {
       lux: mw.lux,
       yearly,
     });
-  }
+  });
 
   // 1b) 计划外照明事故：始终按实际照度全额计入实际用光（按自然年拆分）
   for (const inc of incidentView.items) {
