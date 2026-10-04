@@ -1015,6 +1015,8 @@ async function computeOccupancy(client, exhibitId, {
 
   // 局部重算时把各类时间窗先裁剪到受影响年份的年界区间，再做相减/相交，
   // 保证窗外年份的剂量不会经事故替代估算等途径渗入目标年份。
+  // 注意：本裁剪会把首尾相接的区间合并成一段，只适用于“纯时间覆盖”用途
+  // （计划估算残余的扣减窗）；带照度的实测计量不得使用它（见下方实测部分）。
   const clipToBounds = (windows) => {
     if (!bounds) return windows;
     const parts = [];
@@ -1027,7 +1029,24 @@ async function computeOccupancy(client, exhibitId, {
     }
     return subtractIntervals(parts, []);
   };
-  const scopedMeasWindows = clipToBounds(measWindows);
+  // 单条区间裁剪到受影响年份区间（跨自然年时分别裁剪、拆分），不与其他区间合并：
+  // 每条实测都按自己的时段与照度计量，首尾相接的另一条实测（照度可能不同）
+  // 不得被吞并成一段而沿用前条照度。
+  const clipOneToBounds = (w) => {
+    if (!bounds) return [{ start: w.start, end: w.end }];
+    const parts = [];
+    for (const r of bounds) {
+      const s = Math.max(w.start, r.startMs);
+      const e = Math.min(w.end, r.endMs);
+      if (e > s) parts.push({ start: s, end: e });
+    }
+    return parts;
+  };
+  // 实测覆盖窗仅供计划估算残余扣减（纯时间并集）：逐条裁剪、不合并，
+  // 相接区间是否合并本就不影响扣减结果，但绝不因合并丢失任何一条来源。
+  const scopedMeasWindows = bounds
+    ? measWindows.flatMap((mw) => clipOneToBounds(mw))
+    : measWindows;
   const scopedIncidentWindows = clipToBounds(incidentView.windows);
   const scopedSharedWindows = clipToBounds(sharedView.windows);
   // 停灯有效扣减窗按计划裁剪
@@ -1049,9 +1068,14 @@ async function computeOccupancy(client, exhibitId, {
   const used = {};
   const sources = [];
 
-  // 1) 实测部分（停灯不减实测）
-  for (const mw of scopedMeasWindows) {
-    const yearly = keepYears(yearMapToObject(doseByYear([{ start: mw.start, end: mw.end }], mw.lux)));
+  // 1) 实测部分（停灯不减实测）：逐条计量——每条实测按自己的时段与照度，
+  //    局部重算时先逐条裁剪到目标年份区间（跨自然年分别拆分），
+  //    首尾相接的不同实测保持各自独立来源，不得合并后沿用前条照度。
+  for (const mw of measWindows) {
+    const parts = clipOneToBounds(mw);
+    if (parts.length === 0) continue;
+    const yearly = keepYears(yearMapToObject(doseByYear(parts, mw.lux)));
+    if (yearSet && Object.keys(yearly).length === 0) continue;
     addYearDose(used, yearly);
     sources.push({
       kind: 'measurement',

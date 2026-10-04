@@ -3541,6 +3541,201 @@ async function runFlow() {
     rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [exU] }, 'c');
     assert(rr.status === 200 && rr.body.exhibitCount === 1, '按展品重建');
   }
+
+  // =======================================================================
+  // 局部重算：首尾相接的已确认实测不得合并（各自时段×照度，跨年分别裁剪）；
+  // 实测确认/纠错/批次确认在同事务内同步年度占用与预警，失败整笔回滚
+  // =======================================================================
+  {
+    const q = async (text, params = []) => (await dbModule.pool.query(text, params)).rows;
+    const usageOf = (exId) => q(
+      'SELECT year, used_lxh, confirmed_lxh, residue_lxh FROM annual_usage WHERE exhibit_id = $1 ORDER BY year',
+      [exId]
+    );
+    let rr;
+
+    // ---- A. 同年相接：09:00-13:00@50 接 13:00-17:00@150（照度不同）----
+    const exA = await createExhibit('相接实测展品A');
+    await call('POST', `/api/exhibits/${exA}/limits`, { year: 2032, limitLxh: 1000 }, 'c');
+    const pAdj = await submitPlan(exA, '相接实测计划', '2032-05-01', '2032-05-01',
+      ['09:00-17:00'], 10); // 估算 8h×10 = 80
+    await approvePlan(pAdj);
+    // 以当前占用（估算 80）重建预警基线：低 50%（500）/ 高 80%（800）
+    rr = await call('POST', `/api/exhibits/${exA}/quota-thresholds`,
+      { year: 2032, lowPct: 50, highPct: 80 }, 'c');
+    assert(rr.status === 200, '设置 2032 分级预警阈值');
+
+    rr = await call('POST', '/api/measurements', {
+      planId: pAdj, startDate: '2032-05-01', startTime: '09:00',
+      endDate: '2032-05-01', endTime: '13:00', actualLux: 50,
+    }, 'c');
+    const mA1 = rr.body.measurement.id;
+    rr = await call('POST', `/api/measurements/${mA1}/confirm`, {}, 'c');
+    assert(rr.status === 200, '确认首条实测（4h×50 = 200）');
+    // 首条确认后占用 240（实测 200 + 残余 4h×10），未跨档
+    rr = await call('GET', `/api/quota-alerts?exhibitId=${exA}&year=2032`, null, 'c');
+    assert(rr.body.events.length === 0, '占用 240 未跨档，无预警事件');
+
+    rr = await call('POST', '/api/measurements', {
+      planId: pAdj, startDate: '2032-05-01', startTime: '13:00',
+      endDate: '2032-05-01', endTime: '17:00', actualLux: 150,
+    }, 'c');
+    const mA2 = rr.body.measurement.id;
+    rr = await call('POST', `/api/measurements/${mA2}/confirm`, {}, 'c');
+    assert(rr.status === 200, '确认相接的第二条实测（4h×150 = 600）');
+
+    // 年度占用表（派生）与展品详情（全量口径）一致：实测 200+600=800，残余 0
+    let rows = await usageOf(exA);
+    assert(rows.length === 1 && Number(rows[0].confirmed_lxh) === 800
+      && Number(rows[0].residue_lxh) === 0 && Number(rows[0].used_lxh) === 800,
+      `相接实测各自计量（不得合并后沿用前条照度 50）：${JSON.stringify(rows)}`);
+    rr = await call('GET', `/api/exhibits/${exA}`, null, 'i');
+    assert(rr.body.years['2032'].used === 800, '展品详情 2032 占用 800，与派生表一致');
+    const measSrcA = rr.body.sources.filter((s) => s.kind === 'measurement');
+    assert(measSrcA.length === 2
+      && measSrcA.some((s) => s.id === mA1 && s.yearly['2032'] === 200)
+      && measSrcA.some((s) => s.id === mA2 && s.yearly['2032'] === 600),
+      '占用来源保留两条相接实测各自的时段与照度');
+    rr = await call('GET', '/api/exhibits', null, 'i');
+    const cardA = rr.body.exhibits.find((e) => e.id === exA);
+    assert(cardA.years['2032'].used === 800, '展品列表年度概况（派生表）与详情一致（800）');
+
+    // 分级预警依据正确占用：800/1000 = 80% → 一次跨低、高两档，各留一条事件
+    rr = await call('GET', `/api/quota-alerts?exhibitId=${exA}&year=2032`, null, 'c');
+    const levelsA = rr.body.events.map((e) => e.level).sort();
+    assert(levelsA.length === 2 && levelsA[0] === 'high' && levelsA[1] === 'low',
+      `按正确占用跨两档各留一条事件：${JSON.stringify(rr.body.events)}`);
+    const highEvtA = rr.body.events.find((e) => e.level === 'high');
+    assert(highEvtA && highEvtA.used === 800 && highEvtA.usedPct === 80
+      && highEvtA.triggerType === 'measurement.confirm',
+      '高档事件快照为正确占用 800（80%），触发来源为实测确认');
+    rr = await call('GET', `/api/exhibits/${exA}`, null, 'c');
+    const thA = rr.body.quotaThresholds.find((t) => t.year === 2032);
+    assert(thA && thA.level === 'high' && thA.used === 800,
+      '阈值当前级别 high（占用 800，非合并后的 400）');
+
+    // ---- 失败回滚：纠错与其他实测相交被拒（409），年度占用与预警事件均不变 ----
+    rr = await call('POST', `/api/measurements/${mA1}/correct`, {
+      startDate: '2032-05-01', startTime: '12:00',
+      endDate: '2032-05-01', endTime: '14:00', actualLux: 70,
+      reason: '试图撞入相接实测时段',
+    }, 'c');
+    assert(rr.status === 409, '纠错与其他未作废实测相交被拒（409）');
+    rows = await usageOf(exA);
+    assert(rows.length === 1 && Number(rows[0].used_lxh) === 800
+      && Number(rows[0].confirmed_lxh) === 800,
+      '失败的纠错整笔回滚：年度占用不变');
+    rr = await call('GET', `/api/quota-alerts?exhibitId=${exA}&year=2032`, null, 'c');
+    assert(rr.body.events.length === 2, '失败的纠错不产生新的预警事件');
+
+    // ---- B. 跨年相接：m1 跨 2032→2033，m2 在 2033 相接 ----
+    const exB = await createExhibit('跨年相接实测展品');
+    await call('POST', `/api/exhibits/${exB}/limits`, { year: 2032, limitLxh: 100000 }, 'c');
+    await call('POST', `/api/exhibits/${exB}/limits`, { year: 2033, limitLxh: 100000 }, 'c');
+    const pCross = await submitPlan(exB, '跨年相接计划', '2032-12-31', '2033-01-01',
+      ['20:00-08:00'], 100); // 2032 毛估算 4h、2033 毛估算 20h
+    await approvePlan(pCross);
+    // m1 跨年：2032-12-31 22:00 → 2033-01-01 02:00 @200（2032 2h、2033 2h）
+    rr = await call('POST', '/api/measurements', {
+      planId: pCross, startDate: '2032-12-31', startTime: '22:00',
+      endDate: '2033-01-01', endTime: '02:00', actualLux: 200,
+    }, 'c');
+    const mB1 = rr.body.measurement.id;
+    rr = await call('POST', `/api/measurements/${mB1}/confirm`, {}, 'c');
+    assert(rr.status === 200, '确认跨年实测 m1');
+    // m2 相接：2033-01-01 02:00 → 06:00 @80（2033 4h）
+    rr = await call('POST', '/api/measurements', {
+      planId: pCross, startDate: '2033-01-01', startTime: '02:00',
+      endDate: '2033-01-01', endTime: '06:00', actualLux: 80,
+    }, 'c');
+    const mB2 = rr.body.measurement.id;
+    rr = await call('POST', `/api/measurements/${mB2}/confirm`, {}, 'c');
+    assert(rr.status === 200, '确认相接实测 m2');
+
+    // 2032：实测 2h×200=400，残余 (4−2)h×100=200 → 600
+    // 2033：实测 2h×200+4h×80=720，残余 (20−2−4)h×100=1400 → 2120
+    rows = await usageOf(exB);
+    const b32 = rows.find((x) => x.year === 2032);
+    const b33 = rows.find((x) => x.year === 2033);
+    assert(b32 && Number(b32.confirmed_lxh) === 400 && Number(b32.residue_lxh) === 200
+      && Number(b32.used_lxh) === 600,
+      `跨年相接：2032 实测 400 / 残余 200 / 合计 600：${JSON.stringify(b32)}`);
+    assert(b33 && Number(b33.confirmed_lxh) === 720 && Number(b33.residue_lxh) === 1400
+      && Number(b33.used_lxh) === 2120,
+      `跨年相接：2033 实测 720（不得被 m1 的 200lx 吞并）/ 残余 1400 / 合计 2120：${JSON.stringify(b33)}`);
+    rr = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+    assert(rr.body.years['2032'].used === 600 && rr.body.years['2033'].used === 2120,
+      '跨年相接：展品详情两年占用与派生表一致');
+    rr = await call('GET', '/api/exhibits', null, 'i');
+    const cardB = rr.body.exhibits.find((e) => e.id === exB);
+    assert(cardB.years['2032'].used === 600 && cardB.years['2033'].used === 2120,
+      '跨年相接：列表概况与详情一致');
+
+    // ---- C. 纠错按旧/新年份并集同步：先改 2033 的 m2，再把跨年的 m1 改时段 ----
+    rr = await call('POST', `/api/measurements/${mB2}/correct`, {
+      startDate: '2033-01-01', startTime: '02:00',
+      endDate: '2033-01-01', endTime: '05:00', actualLux: 120,
+      reason: '照度与时长录错',
+    }, 'c');
+    assert(rr.status === 200, '纠错 m2（2033 年内）生效');
+    rows = await usageOf(exB);
+    const c32 = rows.find((x) => x.year === 2032);
+    const c33 = rows.find((x) => x.year === 2033);
+    // 2033：实测 2h×200 + 3h×120 = 760，残余 (20−2−3)h×100 = 1500 → 2260；2032 不变
+    assert(c33 && Number(c33.confirmed_lxh) === 760 && Number(c33.residue_lxh) === 1500
+      && Number(c33.used_lxh) === 2260,
+      `纠错后 2033 同步更新：实测 760 / 残余 1500 / 合计 2260：${JSON.stringify(c33)}`);
+    assert(c32 && Number(c32.used_lxh) === 600 && Number(c32.confirmed_lxh) === 400,
+      '纠错 2033 的实测不影响 2032 派生行（未受影响年份不变）');
+
+    rr = await call('POST', `/api/measurements/${mB1}/correct`, {
+      startDate: '2032-12-31', startTime: '21:00',
+      endDate: '2033-01-01', endTime: '01:00', actualLux: 100,
+      reason: '跨年实测时段照度更正',
+    }, 'c');
+    assert(rr.status === 200, '跨年实测纠错生效');
+    rows = await usageOf(exB);
+    const d32 = rows.find((x) => x.year === 2032);
+    const d33 = rows.find((x) => x.year === 2033);
+    // 2032：实测 3h×100=300，残余 (4−3)h×100=100 → 400
+    // 2033：实测 1h×100 + 3h×120 = 460，残余 (20−1−3)h×100=1600 → 2060
+    assert(d32 && Number(d32.confirmed_lxh) === 300 && Number(d32.residue_lxh) === 100
+      && Number(d32.used_lxh) === 400,
+      `跨年纠错：2032 旧贡献撤回、新贡献计入（300/100/400）：${JSON.stringify(d32)}`);
+    assert(d33 && Number(d33.confirmed_lxh) === 460 && Number(d33.residue_lxh) === 1600
+      && Number(d33.used_lxh) === 2060,
+      `跨年纠错：2033 同步更新（460/1600/2060）：${JSON.stringify(d33)}`);
+    rr = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+    assert(rr.body.years['2032'].used === 400 && rr.body.years['2033'].used === 2060,
+      '跨年纠错后展品详情与派生表一致');
+
+    // ---- D. 批次确认：CSV 两行相接（照度不同），确认后年度占用与详情一致 ----
+    const exC = await createExhibit('批次相接实测展品');
+    await call('POST', `/api/exhibits/${exC}/limits`, { year: 2034, limitLxh: 100000 }, 'c');
+    const pBatch = await submitPlan(exC, '批次相接计划', '2034-06-01', '2034-06-01',
+      ['09:00-17:00'], 100);
+    await approvePlan(pBatch);
+    const csvAdj = '开始,结束,照度\n' +
+      '2034-06-01 09:00,2034-06-01 12:00,60\n' +
+      '2034-06-01 12:00,2034-06-01 15:00,180';
+    rr = await call('POST', '/api/measurement-batches', { planId: pBatch, csv: csvAdj }, 'c');
+    assert(rr.status === 201, `导入相接两行的实测批次：${rr.status} ${JSON.stringify(rr.body).slice(0, 200)}`);
+    const batchId = rr.body.batch.id;
+    rr = await call('POST', `/api/measurement-batches/${batchId}/confirm`, {}, 'c');
+    assert(rr.status === 200, `确认相接实测批次：${rr.status}`);
+    // 实测 3h×60 + 3h×180 = 720，残余 2h×100 = 200 → 920
+    rows = await usageOf(exC);
+    assert(rows.length === 1 && Number(rows[0].confirmed_lxh) === 720
+      && Number(rows[0].residue_lxh) === 200 && Number(rows[0].used_lxh) === 920,
+      `批次相接两行各自计量（不得合并沿用前条 60lx）：${JSON.stringify(rows)}`);
+    rr = await call('GET', `/api/exhibits/${exC}`, null, 'i');
+    assert(rr.body.years['2034'].used === 920, '批次确认后展品详情与派生表一致（920）');
+    const batchMeasSrc = rr.body.sources.filter((s) => s.kind === 'measurement');
+    assert(batchMeasSrc.length === 2
+      && batchMeasSrc.some((s) => s.lux === 60 && s.yearly['2034'] === 180)
+      && batchMeasSrc.some((s) => s.lux === 180 && s.yearly['2034'] === 540),
+      '批次生成的两条相接实测在占用来源中各自独立');
+  }
 }
 
 main().catch((err) => {
